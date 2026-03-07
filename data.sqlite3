@@ -1,0 +1,45 @@
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS submissions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL CHECK (kind IN ('message','endorsement','volunteer','yardsign')),
+  full_name TEXT NOT NULL,
+  email TEXT,
+  phone TEXT,
+  address TEXT,
+  city TEXT,
+  state TEXT,
+  zip TEXT,
+  organization TEXT,
+  role_title TEXT,
+  message TEXT,
+  opt_in_updates INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_submissions_kind_created_at
+  ON submissions(kind, created_at);
+
+CREATE TABLE IF NOT EXISTS donation_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  provider TEXT NOT NULL,           -- e.g., 'stripe'
+  provider_event_id TEXT NOT NULL UNIQUE,
+  amount_cents INTEGER,
+  currency TEXT,
+  donor_name TEXT,
+  donor_email TEXT,
+  status TEXT,                      -- e.g., 'succeeded', 'failed'
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_donation_events_created_at
+  ON donation_events(created_at);
+
+
+CREATE TABLE IF NOT EXISTS donations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  donor_name TEXT,
+  amount REAL NOT NULL,
+  source TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

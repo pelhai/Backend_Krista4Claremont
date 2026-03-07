@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Donation Tracker</title>
+  <style>
+    :root{
+      --bg:#0b1020;
+      --panel:rgba(255,255,255,.08);
+      --panel2:rgba(255,255,255,.06);
+      --text:#eef2ff;
+      --muted:rgba(238,242,255,.72);
+      --border:rgba(255,255,255,.14);
+      --shadow: 0 18px 50px rgba(0,0,0,.35);
+      --radius: 18px;
+      --accent:#22c55e;
+      --accent2:#7c3aed;
+      --danger:#ef4444;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      color:var(--text);
+      background:
+        radial-gradient(900px 600px at 15% -10%, rgba(34,197,94,.30), transparent 55%),
+        radial-gradient(900px 600px at 90% 0%, rgba(124,58,237,.25), transparent 55%),
+        var(--bg);
+      padding:32px 16px;
+    }
+    .wrap{max-width:1180px;margin:0 auto;}
+    .top{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap;}
+    h1{margin:0;font-size:26px;}
+    .muted{color:var(--muted);font-size:13.5px;line-height:1.4;margin-top:6px;}
+    .btn{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:10px 12px;border-radius:14px;
+      border:1px solid var(--border);
+      text-decoration:none;color:var(--text);
+      background: linear-gradient(180deg, var(--panel), var(--panel2));
+      box-shadow: 0 10px 25px rgba(0,0,0,.18);
+    }
+    .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:16px;}
+    @media(max-width:920px){ .grid{grid-template-columns:1fr;} }
+    .card{
+      background: linear-gradient(180deg, var(--panel), var(--panel2));
+      border:1px solid var(--border);
+      border-radius: var(--radius);
+      padding:16px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+    .k{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.08em;}
+    .v{font-size:28px;margin-top:8px;font-weight:850;}
+    .progress{
+      margin-top:12px;
+      height:12px;
+      background: rgba(0,0,0,.18);
+      border:1px solid var(--border);
+      border-radius: 999px;
+      overflow:hidden;
+    }
+    .bar{
+      height:100%;
+      width: {{ progress_pct }}%;
+      background: linear-gradient(90deg, rgba(34,197,94,.95), rgba(124,58,237,.80));
+    }
+    table{
+      width:100%;
+      border-collapse:separate;
+      border-spacing:0;
+      margin-top:14px;
+      overflow:hidden;
+      border-radius: 16px;
+      border:1px solid var(--border);
+      background: rgba(0,0,0,.12);
+    }
+    th,td{
+      border-bottom:1px solid rgba(255,255,255,.10);
+      padding:10px 10px;
+      text-align:left;
+      vertical-align:top;
+      font-size:13.5px;
+    }
+    th{
+      font-size:12px;color:var(--muted);
+      text-transform:uppercase;letter-spacing:.08em;
+      background: rgba(255,255,255,.04);
+    }
+    tr:last-child td{border-bottom:none;}
+    form{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-top:10px;}
+    label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px;}
+    input{
+      padding:10px 10px;border-radius:14px;border:1px solid var(--border);
+      background: rgba(0,0,0,.18);
+      color:var(--text);outline:none;
+      min-width: 180px;
+    }
+    input:focus{border-color: rgba(34,197,94,.65); box-shadow: 0 0 0 4px rgba(34,197,94,.18);}
+    .primary{
+      padding:10px 12px;border-radius:14px;border:1px solid rgba(255,255,255,.16);
+      background: linear-gradient(135deg, rgba(34,197,94,.9), rgba(34,197,94,.60));
+      color:#fff;font-weight:800;cursor:pointer;
+    }
+    .danger{
+      padding:10px 12px;border-radius:14px;border:1px solid rgba(239,68,68,.35);
+      background: rgba(239,68,68,.12);
+      color:#fecaca;font-weight:800;cursor:pointer;
+    }
+    .row{display:flex;gap:12px;flex-wrap:wrap;}
+    .small{color:var(--muted);font-size:12.5px;line-height:1.4}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <h1>Donation Tracker</h1>
+        <div class="muted">Track totals, goal progress, and recent donations.</div>
+      </div>
+      <a class="btn" href="/admin">← Back to Dashboard</a>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="k">Total Raised</div>
+        <div class="v">${{ "%.2f"|format(total_raised) }}</div>
+        <div class="small">Across {{ donation_count }} recorded donations.</div>
+      </div>
+
+      <div class="card">
+        <div class="k">Goal</div>
+        <div class="v">${{ "%.2f"|format(goal_amount) }}</div>
+        <div class="small">Set with <code>DONATION_GOAL</code> env var (default $10,000).</div>
+      </div>
+
+      <div class="card">
+        <div class="k">Progress</div>
+        <div class="v">{{ progress_pct }}%</div>
+        <div class="progress"><div class="bar"></div></div>
+        <div class="small" style="margin-top:10px;">
+          Remaining: ${{ "%.2f"|format(remaining) }}
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px;">
+      <div class="k">Add a donation (manual entry)</div>
+      <form method="post" action="/admin/donations/add">
+        <input type="hidden" name="csrf" value="{{ csrf }}"/>
+        <div>
+          <label>Donor Name</label>
+          <input name="donor_name" placeholder="Optional"/>
+        </div>
+        <div>
+          <label>Amount (USD)</label>
+          <input name="amount" required placeholder="e.g., 50.00"/>
+        </div>
+        <div>
+          <label>Source</label>
+          <input name="source" placeholder="e.g., Stripe, Check, Cash"/>
+        </div>
+        <button class="primary" type="submit">Add Donation</button>
+      </form>
+      <div class="small" style="margin-top:8px;">
+        Tip: If you’re using Stripe Checkout, you can also log the final amounts here for reporting.
+      </div>
+    </div>
+
+    <div style="margin-top:14px;">
+      <div class="row" style="align-items:baseline; justify-content:space-between;">
+        <h2 style="margin:0; font-size:16px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em;">Recent Donations</h2>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th style="width:90px;">ID</th>
+            <th>Donor</th>
+            <th style="width:140px;">Amount</th>
+            <th style="width:180px;">Source</th>
+            <th style="width:180px;">Received</th>
+            <th style="width:140px;">Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for d in donations %}
+          <tr>
+            <td>{{ d.id }}</td>
+            <td>{{ d.donor_name }}</td>
+            <td>${{ "%.2f"|format(d.amount) }}</td>
+            <td>{{ d.source }}</td>
+            <td>{{ d.created_at }}</td>
+            <td>
+              <form method="post" action="/admin/donations/delete" style="margin:0;">
+                <input type="hidden" name="csrf" value="{{ csrf }}"/>
+                <input type="hidden" name="id" value="{{ d.id }}"/>
+                <button class="danger" type="submit" onclick="return confirm('Delete this donation entry?');">Delete</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+          {% if donations|length == 0 %}
+          <tr>
+            <td colspan="6" style="color:var(--muted);">No donations recorded yet.</td>
+          </tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body>
+</html>

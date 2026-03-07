@@ -1,0 +1,519 @@
+import os
+import re
+import hmac
+import time
+import json
+import sqlite3
+import secrets
+from typing import Any, Dict, List, Optional, Tuple
+
+from flask import Flask, request, jsonify, g, render_template, redirect, url_for, session, abort
+
+# -----------------------------
+# Configuration
+# -----------------------------
+BASE_DIR = os.path.dirname(__file__)
+DATA_DIR = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))
+os.makedirs(DATA_DIR, exist_ok=True)
+
+DB_PATH = os.getenv("DB_PATH", os.path.join(DATA_DIR, "data.sqlite3"))
+SCHEMA_PATH = os.getenv("SCHEMA_PATH", os.path.join(BASE_DIR, "schema.sql"))
+
+# Admin credentials (set these in env vars in production)
+ADMIN_USER = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "change-me")  # change in production
+SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
+
+# Simple in-memory rate limit (per IP)
+RATE_LIMIT_WINDOW_SEC = int(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
+RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "30"))
+_rate_bucket: Dict[str, List[float]] = {}
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+app = Flask(__name__)
+app.secret_key = SECRET_KEY
+
+
+
+# -----------------------------
+# DB helpers
+# -----------------------------
+def _connect_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    # Better concurrency / durability for SQLite
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+    except sqlite3.OperationalError:
+        conn.execute("PRAGMA journal_mode=DELETE;")
+    #conn.execute("PRAGMA journal_mode=WAL;")
+    #conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
+
+def get_db() -> sqlite3.Connection:
+    if "db" not in g:
+        g.db = _connect_db()
+    return g.db
+
+@app.teardown_appcontext
+def close_db(exception: Optional[BaseException]) -> None:
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+def init_db() -> None:
+    db = _connect_db()
+    with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
+        db.executescript(f.read())
+    db.commit()
+    db.close()
+
+# Initialize DB on startup (persistence: SQLite file on disk)
+if not os.path.exists(DB_PATH):
+    init_db()
+else:
+    # Ensure new tables get created if schema.sql changed
+    init_db()
+
+# -----------------------------
+# Security headers
+# -----------------------------
+@app.after_request
+def add_security_headers(resp):
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "SAMEORIGIN"
+    resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    resp.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    # NOTE: If embedding into Squarespace via <script>, you may need to loosen CSP.
+    resp.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'self'; base-uri 'self';"
+    return resp
+
+# -----------------------------
+# Rate limiting
+# -----------------------------
+def _rate_limit(ip: str) -> bool:
+    now = time.time()
+    bucket = _rate_bucket.setdefault(ip, [])
+    cutoff = now - RATE_LIMIT_WINDOW_SEC
+    while bucket and bucket[0] < cutoff:
+        bucket.pop(0)
+    if len(bucket) >= RATE_LIMIT_MAX:
+        return False
+    bucket.append(now)
+    return True
+
+@app.before_request
+def enforce_rate_limit():
+    if request.path.startswith("/api/"):
+        ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+        if not _rate_limit(ip):
+            return jsonify({"ok": False, "error": "rate_limited"}), 429
+
+# -----------------------------
+# Input validation
+# -----------------------------
+def _clean_text(v: str, max_len: int = 2000) -> str:
+    v = (v or "").strip()
+    v = re.sub(r"\s+", " ", v)
+    return v[:max_len]
+
+def validate_submission(payload: Dict[str, Any]) -> Tuple[bool, str]:
+    kind = payload.get("kind", "")
+    if kind not in {"message", "endorsement", "volunteer", "yardsign"}:
+        return False, "invalid_kind"
+
+    full_name = _clean_text(payload.get("full_name", ""), 120)
+    if not full_name:
+        return False, "full_name_required"
+
+    email = _clean_text(payload.get("email", ""), 254)
+    if email and not EMAIL_RE.match(email):
+        return False, "invalid_email"
+
+    # Light anti-spam honeypot
+    if payload.get("company_website"):  # field that should stay empty
+        return False, "spam_detected"
+
+    return True, "ok"
+
+# -----------------------------
+# Public API: submissions
+# -----------------------------
+
+@app.get("/")
+def home():
+    return jsonify({"ok": True, "service": "backend", "health": "/healthz"})
+
+@app.post("/api/submit")
+def api_submit():
+    payload = request.get_json(silent=True) or {}
+    ok, reason = validate_submission(payload)
+    if not ok:
+        return jsonify({"ok": False, "error": reason}), 400
+
+    db = get_db()
+    db.execute(
+        """
+        INSERT INTO submissions
+        (kind, full_name, email, phone, address, city, state, zip, organization, role_title, message, opt_in_updates)
+        VALUES
+        (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload["kind"],
+            _clean_text(payload.get("full_name", ""), 120),
+            _clean_text(payload.get("email", ""), 254),
+            _clean_text(payload.get("phone", ""), 40),
+            _clean_text(payload.get("address", ""), 200),
+            _clean_text(payload.get("city", ""), 80),
+            _clean_text(payload.get("state", ""), 30),
+            _clean_text(payload.get("zip", ""), 20),
+            _clean_text(payload.get("organization", ""), 120),
+            _clean_text(payload.get("role_title", ""), 120),
+            _clean_text(payload.get("message", ""), 4000),
+            1 if payload.get("opt_in_updates") else 0,
+        ),
+    )
+    db.commit()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/endorsements")
+def api_endorsements():
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT full_name, organization, role_title, message, created_at
+        FROM submissions
+        WHERE kind='endorsement'
+        ORDER BY id DESC
+        LIMIT 12
+        """
+    ).fetchall()
+    return jsonify({
+        "ok": True,
+        "endorsements": [
+            {
+                "full_name": r["full_name"],
+                "organization": r["organization"],
+                "role_title": r["role_title"],
+                "message": r["message"],
+                "created_at": r["created_at"],
+            } for r in rows
+        ]
+    })
+
+
+# -----------------------------
+# Admin auth + CSRF
+# -----------------------------
+def _constant_time_eq(a: str, b: str) -> bool:
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+def require_admin():
+    if not session.get("is_admin"):
+        abort(401)
+
+def ensure_csrf():
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return token
+
+def _parse_amount(v: str) -> float:
+    v = (v or "").strip()
+    v = re.sub(r"[^0-9.]", "", v)
+    return float(v)
+
+@app.get("/admin/donations")
+def admin_donations():
+    require_admin()
+    csrf = ensure_csrf()
+    db = get_db()
+
+    goal_amount = float(os.getenv("DONATION_GOAL", "10000"))
+    total_raised = db.execute("SELECT COALESCE(SUM(amount), 0) AS s FROM donations").fetchone()["s"]
+    donation_count = db.execute("SELECT COUNT(*) AS c FROM donations").fetchone()["c"]
+
+    remaining = max(0.0, goal_amount - float(total_raised))
+    progress_pct = int(min(100, round((float(total_raised) / goal_amount) * 100))) if goal_amount > 0 else 0
+
+    donations = db.execute(
+        "SELECT id, donor_name, amount, source, created_at FROM donations ORDER BY id DESC LIMIT 50"
+    ).fetchall()
+
+    return render_template(
+        "donations.html",
+        csrf=csrf,
+        goal_amount=goal_amount,
+        total_raised=float(total_raised),
+        donation_count=int(donation_count),
+        remaining=remaining,
+        progress_pct=progress_pct,
+        donations=donations,
+    )
+
+@app.post("/admin/donations/add")
+def admin_donations_add():
+    require_admin()
+    csrf = ensure_csrf()
+    form_csrf = request.form.get("csrf", "")
+    if not _constant_time_eq(form_csrf, csrf):
+        abort(400)
+
+    donor_name = _clean_text(request.form.get("donor_name", ""), 120)
+    source = _clean_text(request.form.get("source", ""), 120)
+
+    try:
+        amount = _parse_amount(request.form.get("amount", ""))
+        if amount <= 0 or amount > 1_000_000:
+            raise ValueError("amount out of range")
+    except Exception:
+        abort(400)
+
+    db = get_db()
+    db.execute(
+        "INSERT INTO donations (donor_name, amount, source) VALUES (?, ?, ?)",
+        (donor_name, float(amount), source),
+    )
+    db.commit()
+    return redirect(url_for("admin_donations"))
+
+@app.post("/admin/donations/delete")
+def admin_donations_delete():
+    require_admin()
+    csrf = ensure_csrf()
+    form_csrf = request.form.get("csrf", "")
+    if not _constant_time_eq(form_csrf, csrf):
+        abort(400)
+
+    try:
+        did = int(request.form.get("id", "0"))
+    except Exception:
+        abort(400)
+
+    db = get_db()
+    db.execute("DELETE FROM donations WHERE id = ?", (did,))
+    db.commit()
+    return redirect(url_for("admin_donations"))
+
+
+@app.get("/admin/login")
+def admin_login_get():
+    csrf = ensure_csrf()
+    return render_template("login.html", csrf=csrf)
+
+@app.post("/admin/login")
+def admin_login_post():
+    csrf = ensure_csrf()
+    form_csrf = request.form.get("csrf", "")
+    if not _constant_time_eq(form_csrf, csrf):
+        abort(400)
+
+    user = request.form.get("username", "")
+    pw = request.form.get("password", "")
+    if _constant_time_eq(user, ADMIN_USER) and _constant_time_eq(pw, ADMIN_PASSWORD):
+        session["is_admin"] = True
+        return redirect(url_for("admin_dashboard"))
+    return render_template("login.html", csrf=csrf, error="Invalid credentials")
+
+@app.post("/admin/logout")
+def admin_logout():
+    require_admin()
+    csrf = ensure_csrf()
+    form_csrf = request.form.get("csrf", "")
+    if not _constant_time_eq(form_csrf, csrf):
+        abort(400)
+    session.clear()
+    return redirect(url_for("admin_login_get"))
+
+
+# -----------------------------
+# Admin views
+# -----------------------------
+@app.get("/admin")
+def admin_dashboard():
+    require_admin()
+    csrf = ensure_csrf()
+    db = get_db()
+
+    counts = dict(
+        (row["kind"], row["c"]) for row in db.execute("SELECT kind, COUNT(*) AS c FROM submissions GROUP BY kind")
+    )
+    latest = db.execute(
+        "SELECT id, kind, full_name, email, message, created_at FROM submissions ORDER BY id DESC LIMIT 20"
+    ).fetchall()
+
+    insights = compute_messaging_insights(db)
+
+    return render_template(
+        "dashboard.html",
+        csrf=csrf,
+        counts=counts,
+        latest=latest,
+        insights=insights,
+    )
+
+@app.get("/admin/snippets")
+def admin_snippets():
+    require_admin()
+    csrf = ensure_csrf()
+    db = get_db()
+
+    endorsements = db.execute(
+        """
+        SELECT full_name, organization, role_title, message, created_at
+        FROM submissions
+        WHERE kind='endorsement'
+        ORDER BY id DESC
+        LIMIT 12
+        """
+    ).fetchall()
+
+    html_snippet = render_endorsement_snippet(endorsements)
+    return render_template("snippets.html", csrf=csrf, endorsement_html=html_snippet)
+
+# -----------------------------
+# Messaging insights
+# -----------------------------
+STOPWORDS = {
+    "the","and","a","an","to","of","in","for","on","with","is","are","was","were","be","been","it",
+    "this","that","i","we","you","they","our","your","my","me","us","as","at","by","from","or",
+    "school","schools","district","claremont","cusd"
+}
+
+def tokenize(text: str) -> List[str]:
+    text = (text or "").lower()
+    text = re.sub(r"[^a-z0-9\s'-]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    toks = [t for t in text.split(" ") if t and len(t) > 2 and t not in STOPWORDS]
+    return toks
+
+def compute_messaging_insights(db: sqlite3.Connection) -> Dict[str, Any]:
+    rows = db.execute(
+        """
+        SELECT kind, message, zip
+        FROM submissions
+        WHERE message IS NOT NULL AND message != ''
+        ORDER BY id DESC
+        LIMIT 500
+        """
+    ).fetchall()
+
+    freq: Dict[str, int] = {}
+    zip_counts: Dict[str, int] = {}
+    for r in rows:
+        for t in tokenize(r["message"]):
+            freq[t] = freq.get(t, 0) + 1
+        z = (r["zip"] or "").strip()
+        if z:
+            zip_counts[z] = zip_counts.get(z, 0) + 1
+
+    top_terms = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:12]
+    top_zips = sorted(zip_counts.items(), key=lambda x: x[1], reverse=True)[:8]
+
+    recos = []
+    themes = [t for t, _ in top_terms]
+    if any(t in themes for t in ["budget","fiscal","finance","oversight"]):
+        recos.append("Lead with clear, plain-language fiscal stewardship: budget transparency, long-term planning, risk-aware decisions.")
+    if any(t in themes for t in ["mental","health","wellbeing","belonging","safety"]):
+        recos.append("Highlight student well-being and belonging: concrete, school-board-appropriate policy focus (support systems, partnerships).")
+    if any(t in themes for t in ["ai","technology","tech"]):
+        recos.append("Frame technology/AI as responsible readiness: student safety, literacy, and thoughtful classroom integration.")
+    if not recos:
+        recos.append("Use a consistent 3-point message: student-centered outcomes, fiscal responsibility, community collaboration.")
+
+    return {
+        "top_terms": top_terms,
+        "top_zips": top_zips,
+        "recommendations": recos,
+        "sample_size": len(rows),
+    }
+
+# -----------------------------
+# HTML snippet generator
+# -----------------------------
+def escape_html(s: str) -> str:
+    return (
+        (s or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#x27;")
+    )
+
+def render_endorsement_snippet(rows) -> str:
+    cards = []
+    for r in rows:
+        name = escape_html(r["full_name"])
+        org = escape_html(r["organization"] or "")
+        title = escape_html(r["role_title"] or "")
+        msg = escape_html((r["message"] or "").strip())
+        subtitle = " · ".join([x for x in [title, org] if x])
+
+        cards.append(f"""
+<div class="kce-card">
+  <div class="kce-card__title">{name}</div>
+  <div class="kce-card__subtitle">{subtitle}</div>
+  <div class="kce-card__body">{msg}</div>
+</div>
+""".strip())
+    return "\n".join(cards)
+
+# -----------------------------
+# Donation integration (Stripe Checkout skeleton)
+# -----------------------------
+# Requirements ask for donation collection + bank deposit (bank account configured in Stripe by campaign staff).
+# This endpoint creates a Stripe Checkout session; sensitive card data never hits your server.
+
+try:
+    import stripe  # type: ignore
+except Exception:
+    stripe = None
+
+@app.post("/api/create-donation-session")
+def api_create_donation_session():
+    if stripe is None:
+        return jsonify({"ok": False, "error": "stripe_not_installed"}), 501
+
+    payload = request.get_json(silent=True) or {}
+    amount = payload.get("amount")
+    try:
+        amount_cents = int(round(float(amount) * 100))
+    except Exception:
+        return jsonify({"ok": False, "error": "invalid_amount"}), 400
+
+    if amount_cents < 100 or amount_cents > 500000:
+        return jsonify({"ok": False, "error": "amount_out_of_range"}), 400
+
+    stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "")
+    if not stripe.api_key:
+        return jsonify({"ok": False, "error": "stripe_not_configured"}), 500
+
+    success_url = payload.get("success_url") or (request.host_url.rstrip("/") + "/donation-success")
+    cancel_url = payload.get("cancel_url") or (request.host_url.rstrip("/") + "/donation-cancelled")
+
+    session_obj = stripe.checkout.Session.create(
+        mode="payment",
+        line_items=[{
+            "price_data": {
+                "currency": "usd",
+                "product_data": {"name": "Friends of Krista Carson Elhai — Campaign Donation"},
+                "unit_amount": amount_cents,
+            },
+            "quantity": 1,
+        }],
+        success_url=success_url + "?session_id={CHECKOUT_SESSION_ID}",
+        cancel_url=cancel_url,
+    )
+    return jsonify({"ok": True, "checkout_url": session_obj.url})
+
+@app.get("/healthz")
+def healthz():
+    return jsonify({"ok": True})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")), debug=True)
